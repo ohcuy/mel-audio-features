@@ -10,9 +10,22 @@
 		CAB1962C2E209635008E691E /* mel-audio-features.app */ = {isa = PBXFileReference; explicitFileType = wrapper.application; includeInIndex = 0; path = "mel-audio-features.app"; sourceTree = BUILT_PRODUCTS_DIR; };
 /* End PBXFileReference section */
 
+/* Begin PBXFileSystemSynchronizedBuildFileExceptionSet section */
+		CAACD44A2E23F8D900DD20F6 /* Exceptions for "mel-audio-features" folder in "mel-audio-features" target */ = {
+			isa = PBXFileSystemSynchronizedBuildFileExceptionSet;
+			membershipExceptions = (
+				Info.plist,
+			);
+			target = CAB1962B2E209635008E691E /* mel-audio-features */;
+		};
+/* End PBXFileSystemSynchronizedBuildFileExceptionSet section */
+
 /* Begin PBXFileSystemSynchronizedRootGroup section */
 		CAB1962E2E209635008E691E /* mel-audio-features */ = {
 			isa = PBXFileSystemSynchronizedRootGroup;
+			exceptions = (
+				CAACD44A2E23F8D900DD20F6 /* Exceptions for "mel-audio-features" folder in "mel-audio-features" target */,
+			);
 			path = "mel-audio-features";
 			sourceTree = "<group>";
 		};
@@ -256,7 +269,10 @@
 				DEVELOPMENT_TEAM = 6TW9MCXPJD;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "mel-audio-features/Info.plist";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "이 앱은 오디오 파일을 입력받아 분석합니다.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "이 앱은 마이크 입력을 사용하여 스펙트로그램을 생성합니다.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "이 앱은 오디오 파일을 입력받아 분석합니다.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;
@@ -285,7 +301,10 @@
 				DEVELOPMENT_TEAM = 6TW9MCXPJD;
 				ENABLE_PREVIEWS = YES;
 				GENERATE_INFOPLIST_FILE = YES;
+				INFOPLIST_FILE = "mel-audio-features/Info.plist";
+				INFOPLIST_KEY_NSDocumentsFolderUsageDescription = "이 앱은 오디오 파일을 입력받아 분석합니다.";
 				INFOPLIST_KEY_NSMicrophoneUsageDescription = "이 앱은 마이크 입력을 사용하여 스펙트로그램을 생성합니다.";
+				INFOPLIST_KEY_NSPhotoLibraryUsageDescription = "이 앱은 오디오 파일을 입력받아 분석합니다.";
 				INFOPLIST_KEY_UIApplicationSceneManifest_Generation = YES;
 				INFOPLIST_KEY_UIApplicationSupportsIndirectInputEvents = YES;
 				INFOPLIST_KEY_UILaunchScreen_Generation = YES;

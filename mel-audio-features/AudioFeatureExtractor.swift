@@ -17,20 +17,20 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
     private var audioRecorder: AVAudioRecorder?
     private var audioPlayer: AVAudioPlayer?
     private var audioFileURL: URL?
-
+    
     @Published var isRecording = false
     @Published var extractedFeatures: [Float]? // 추출된 특징 벡터
     @Published var errorMessage: String?
     @Published var archive: Archive = []
-
+    
     private let archiveFileName = "audio_archive.json"
-
+    
     override init() {
         super.init()
         setupAudioSession()
         self.loadArchive()
     }
-
+    
     // 오디오 세션 설정 (녹음 권한 요청)
     private func setupAudioSession() {
         let audioSession = AVAudioSession.sharedInstance()
@@ -48,18 +48,22 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             errorMessage = "Failed to set up audio session: \(error.localizedDescription)"
         }
     }
-
+    
+    func analyzeExternalFile(url: URL) {
+        processAudioFile(url: url)
+    }
+    
     func startRecording() {
         let filename = UUID().uuidString + ".m4a"
         audioFileURL = getDocumentsDirectory().appendingPathComponent(filename)
-
+        
         let settings: [String: Any] = [
             AVFormatIDKey: Int(kAudioFormatMPEG4AAC),
             AVSampleRateKey: 22050, // 샘플레이트
             AVNumberOfChannelsKey: 1, // 모노 채널
             AVEncoderAudioQualityKey: AVAudioQuality.high.rawValue
         ]
-
+        
         do {
             audioRecorder = try AVAudioRecorder(url: audioFileURL!, settings: settings)
             audioRecorder?.delegate = self
@@ -70,7 +74,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             errorMessage = "Could not start recording: \(error.localizedDescription)"
         }
     }
-
+    
     // 녹음 종료 후 오디오 파일 처리
     func stopRecording() {
         audioRecorder?.stop()
@@ -79,16 +83,16 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             processAudioFile(url: url)
         }
     }
-
+    
     func getDocumentsDirectory() -> URL {
         let paths = FileManager.default.urls(for: .documentDirectory, in: .userDomainMask)
         return paths[0]
     }
-
+    
     func getArchiveFileURL() -> URL {
         getDocumentsDirectory().appendingPathComponent(archiveFileName)
     }
-
+    
     // 기록된 archive 로드
     func loadArchive() {
         let url = getArchiveFileURL()
@@ -103,7 +107,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             self.archive = []
         }
     }
-
+    
     func saveArchive() {
         let url = getArchiveFileURL()
         do {
@@ -113,66 +117,86 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             print("Failed to save archive: \(error)")
         }
     }
-
+    
     // 오디오 파일 처리 → 특징 추출
-    private func processAudioFile(url: URL) {
+    func processAudioFile(url: URL) {
         do {
-            let audioFile = try AVAudioFile(forReading: url)
+            let originalAudioFile = try AVAudioFile(forReading: url)
+            let originalFormat = originalAudioFile.processingFormat
+            let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 22050, channels: 1, interleaved: false)!
+
+            let needsConversion = originalFormat.channelCount != 1 || originalFormat.commonFormat != .pcmFormatFloat32 || originalFormat.sampleRate != 22050
+            var audioFile: AVAudioFile = originalAudioFile
+
+            if needsConversion {
+                // Prepare AVAudioConverter
+                let converter = AVAudioConverter(from: originalFormat, to: targetFormat)!
+                let frameCount = AVAudioFrameCount(originalAudioFile.length)
+                guard let inputBuffer = AVAudioPCMBuffer(pcmFormat: originalFormat, frameCapacity: frameCount) else {
+                    errorMessage = "Failed to create input buffer."
+                    return
+                }
+                try originalAudioFile.read(into: inputBuffer)
+                guard let outputBuffer = AVAudioPCMBuffer(pcmFormat: targetFormat, frameCapacity: frameCount) else {
+                    errorMessage = "Failed to create output buffer."
+                    return
+                }
+                var error: NSError? = nil
+                let inputBlock: AVAudioConverterInputBlock = { inNumPackets, outStatus in
+                    outStatus.pointee = .haveData
+                    return inputBuffer
+                }
+                converter.convert(to: outputBuffer, error: &error, withInputFrom: inputBlock)
+                if let error = error {
+                    self.errorMessage = "Error converting audio: \(error.localizedDescription)"
+                    return
+                }
+                // Write to a temp file
+                let tempURL = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString + ".caf")
+                do {
+                    let outputFile = try AVAudioFile(forWriting: tempURL, settings: targetFormat.settings)
+                    try outputFile.write(from: outputBuffer)
+                    audioFile = try AVAudioFile(forReading: tempURL)
+                } catch {
+                    self.errorMessage = "Error writing converted file: \(error.localizedDescription)"
+                    return
+                }
+            }
+
             let format = audioFile.processingFormat
-
-            // Ensure the format is float and mono
-            guard format.channelCount == 1 else {
-                errorMessage = "Audio file must be mono."
-                return
-            }
-            guard format.commonFormat == .pcmFormatFloat32 else {
-                errorMessage = "Audio file must be PCM float32."
-                return
-            }
-
             let frameCount = AVAudioFrameCount(audioFile.length)
             guard let buffer = AVAudioPCMBuffer(pcmFormat: format, frameCapacity: frameCount) else {
                 errorMessage = "Failed to create audio buffer."
                 return
             }
-
             try audioFile.read(into: buffer)
-
             guard let floatChannelData = buffer.floatChannelData else {
                 errorMessage = "Failed to get float channel data."
                 return
             }
-
             let audioSamples = Array(UnsafeBufferPointer(start: floatChannelData[0], count: Int(frameCount)))
-
-            // 전처리: 정규화, silence trim
             let preprocessedSamples = preprocessAudio(samples: audioSamples, sampleRate: Float(format.sampleRate))
-
-            // 특징 추출
             extractedFeatures = extractFeatures(samples: preprocessedSamples, sampleRate: 22050)
-
-            // 기록 추가
             if let features = self.extractedFeatures, !features.isEmpty {
                 let record = ArchiveRecord(id: UUID(), date: Date(), audioFileName: url.lastPathComponent, features: features)
                 self.archive.append(record)
                 self.saveArchive()
             }
-
         } catch {
             errorMessage = "Error processing audio file: \(error.localizedDescription)"
         }
     }
-
+    
     // 오디오 정규화 + 단순 무음 제거
     private func preprocessAudio(samples: [Float], sampleRate: Float) -> [Float] {
         var processedSamples = samples
-
+        
         // 1. -1 ~ 1 사이로 정규화
         if let maxAbs = processedSamples.map({ abs($0) }).max(), maxAbs > 0 {
             processedSamples = processedSamples.map { $0 / maxAbs }
         }
-
-
+        
+        
         // 2. 무음 구간 앞뒤 잘라내기 (단순 임계값 기반)
         let silenceThreshold: Float = 0.01
         var startIndex = 0
@@ -182,7 +206,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
                 break
             }
         }
-
+        
         var endIndex = processedSamples.count - 1
         for i in (0..<processedSamples.count).reversed() {
             if abs(processedSamples[i]) > silenceThreshold {
@@ -190,16 +214,16 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
                 break
             }
         }
-
+        
         if startIndex <= endIndex {
             processedSamples = Array(processedSamples[startIndex...endIndex])
         } else {
             processedSamples = [] // 전체 무음인 경우
         }
-
+        
         return processedSamples
     }
-
+    
     func calculateRMSEnergy(samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0.0 }
         var squaredSamples = [Float](repeating: 0.0, count: samples.count)
@@ -208,10 +232,10 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         vDSP_sve(squaredSamples, 1, &sumOfSquares, vDSP_Length(squaredSamples.count))
         return sqrt(sumOfSquares / Float(samples.count))
     }
-
+    
     func calculateEnergyEntropy(samples: [Float], frameSize: Int, hopSize: Int) -> Float {
         guard !samples.isEmpty else { return 0.0 }
-
+        
         var energies: [Float] = []
         for i in stride(from: 0, to: samples.count - frameSize + 1, by: hopSize) {
             let frame = Array(samples[i..<i+frameSize])
@@ -221,14 +245,14 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             vDSP_sve(squaredFrame, 1, &sumOfSquares, vDSP_Length(squaredFrame.count))
             energies.append(sumOfSquares)
         }
-
+        
         guard !energies.isEmpty else { return 0.0 }
-
+        
         let totalEnergy = energies.reduce(0, +)
         guard totalEnergy > 0 else { return 0.0 }
-
+        
         let probabilities = energies.map { $0 / totalEnergy }
-
+        
         var entropy: Float = 0.0
         for p in probabilities {
             if p > 0 {
@@ -237,12 +261,12 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return entropy
     }
-
+    
     func calculateDynamicRange(peakEnergy: Float, rmsEnergy: Float) -> Float {
         guard rmsEnergy > 0 else { return 0.0 } // 0으로 나누는 것 방지
         return 20 * log10(peakEnergy / rmsEnergy)
     }
-
+    
     func calculateZeroCrossingRate(samples: [Float]) -> Float {
         guard !samples.isEmpty else { return 0.0 }
         var zcr: Float = 0.0
@@ -253,7 +277,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return zcr / Float(samples.count)
     }
-
+    
     // 해닝 윈도우 함수
     func hanningWindow(size: Int) -> [Float] {
         var window = [Float](repeating: 0.0, count: size)
@@ -262,76 +286,76 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return window
     }
-
+    
     // Short-Time Fourier Transform (STFT)
     func stft(samples: [Float], n_fft: Int, hop_length: Int) -> [[Float]] {
         var spectrogram: [[Float]] = []
         let window = hanningWindow(size: n_fft)
-
+        
         let numFrames = Int(floor(Float(samples.count - n_fft) / Float(hop_length))) + 1
-
+        
         // numFrames가 1보다 작을 때(즉, 잘못된 범위가 만들어질 때) 반복을 건너뛰고 빈 배열을 반환
         if numFrames < 1 {
             return []
         }
-
+        
         for i in 0..<numFrames {
             let start = i * hop_length
             let end = start + n_fft
             guard end <= samples.count else { break }
-
+            
             var frame = Array(samples[start..<end])
-
+            
             // Apply window
             vDSP_vmul(frame, 1, window, 1, &frame, 1, vDSP_Length(n_fft))
-
+            
             // Perform FFT
             let log2n = vDSP_Length(log2(Float(n_fft)))
             let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
-
+            
             var real = [Float](repeating: 0.0, count: n_fft / 2)
             var imag = [Float](repeating: 0.0, count: n_fft / 2)
             var complex = DSPSplitComplex(realp: &real, imagp: &imag)
-
+            
             frame.withUnsafeMutableBufferPointer { (frameBuffer: inout UnsafeMutableBufferPointer<Float>) in
                 frameBuffer.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n_fft / 2) { (complexBuffer: UnsafeMutablePointer<DSPComplex>) in
                     vDSP_ctoz(complexBuffer, 2, &complex, 1, vDSP_Length(n_fft / 2))
                 }
             }
-
+            
             vDSP_fft_zrip(fftSetup!, &complex, 1, log2n, FFTDirection(kFFTDirection_Forward))
-
+            
             // 크기 계산
             var magnitudes = [Float](repeating: 0.0, count: n_fft / 2)
             vDSP_zvmags(&complex, 1, &magnitudes, 1, vDSP_Length(n_fft / 2))
-
+            
             // 파워 스펙트럼으로 변환 (크기 제곱)
             var powerSpectrum = [Float](repeating: 0.0, count: n_fft / 2)
             vDSP_vsq(magnitudes, 1, &powerSpectrum, 1, vDSP_Length(n_fft / 2))
-
+            
             spectrogram.append(powerSpectrum)
-
+            
             vDSP_destroy_fftsetup(fftSetup)
         }
         return spectrogram
     }
-
+    
     func calculateSpectralCentroid(spectrogram: [[Float]], sampleRate: Float, n_fft: Int) -> [Float] {
         guard !spectrogram.isEmpty else { return [] }
-
+        
         var centroids: [Float] = []
         let fftBins = n_fft / 2
         let frequencies = (0..<fftBins).map { Float($0) * sampleRate / Float(n_fft) }
-
+        
         for frame in spectrogram {
             var sumWeightedFrequencies: Float = 0.0
             var sumMagnitudes: Float = 0.0
-
+            
             for i in 0..<frame.count {
                 sumWeightedFrequencies += frequencies[i] * frame[i]
                 sumMagnitudes += frame[i]
             }
-
+            
             if sumMagnitudes > 0 {
                 centroids.append(sumWeightedFrequencies / sumMagnitudes)
             } else {
@@ -340,24 +364,24 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return centroids
     }
-
+    
     func calculateSpectralBandwidth(spectrogram: [[Float]], spectralCentroids: [Float], sampleRate: Float, n_fft: Int) -> Float {
         guard !spectrogram.isEmpty && !spectralCentroids.isEmpty else { return 0.0 }
-
+        
         var bandwidths: [Float] = []
         let fftBins = n_fft / 2
         let frequencies = (0..<fftBins).map { Float($0) * sampleRate / Float(n_fft) }
-
+        
         for (frameIndex, frame) in spectrogram.enumerated() {
             let centroid = spectralCentroids[frameIndex]
             var sumWeightedSquaredFrequencies: Float = 0.0
             var sumMagnitudes: Float = 0.0
-
+            
             for i in 0..<frame.count {
                 sumWeightedSquaredFrequencies += pow(frequencies[i] - centroid, 2) * frame[i]
                 sumMagnitudes += frame[i]
             }
-
+            
             if sumMagnitudes > 0 {
                 bandwidths.append(sqrt(sumWeightedSquaredFrequencies / sumMagnitudes))
             } else {
@@ -366,10 +390,10 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return bandwidths.reduce(0, +) / Float(bandwidths.count)
     }
-
+    
     func calculateSpectralContrast(spectrogram: [[Float]]) -> Float {
         guard !spectrogram.isEmpty else { return 0.0 }
-
+        
         var contrasts: [Float] = []
         for frame in spectrogram {
             // 단순화된 콘트라스트 계산: 피크(봉우리)와 밸리(골짜기)의 비율
@@ -383,16 +407,16 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return contrasts.reduce(0, +) / Float(contrasts.count)
     }
-
+    
     func calculateSpectralFlatness(spectrogram: [[Float]]) -> Float {
         guard !spectrogram.isEmpty else { return 0.0 }
-
+        
         var flatnessValues: [Float] = []
         for frame in spectrogram {
             guard frame.count > 0 else { continue }
             let geometricMean = pow(frame.reduce(1.0, *), 1.0 / Float(frame.count))
             let arithmeticMean = frame.reduce(0.0, +) / Float(frame.count)
-
+            
             if arithmeticMean > 0 {
                 flatnessValues.append(geometricMean / arithmeticMean)
             } else {
@@ -401,21 +425,21 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return flatnessValues.reduce(0, +) / Float(flatnessValues.count)
     }
-
+    
     func calculateSpectralRolloff(spectrogram: [[Float]], sampleRate: Float, n_fft: Int, rollOffPercent: Float = 0.85) -> Float {
         guard !spectrogram.isEmpty else { return 0.0 }
-
+        
         var rolloffs: [Float] = []
         let fftBins = n_fft / 2
         let frequencies = (0..<fftBins).map { Float($0) * sampleRate / Float(n_fft) }
-
+        
         for frame in spectrogram {
             let totalEnergy = frame.reduce(0, +)
             guard totalEnergy > 0 else { rolloffs.append(0.0); continue }
-
+            
             let thresholdEnergy = totalEnergy * rollOffPercent
             var currentEnergy: Float = 0.0
-
+            
             for i in 0..<frame.count {
                 currentEnergy += frame[i]
                 if currentEnergy >= thresholdEnergy {
@@ -426,25 +450,25 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return rolloffs.reduce(0, +) / Float(rolloffs.count)
     }
-
+    
     func calculateOnsetStrengthMean(spectrogram: [[Float]]) -> Float {
         guard !spectrogram.isEmpty else { return 0.0 }
-
+        
         var onsetStrengths: [Float] = []
         for i in 1..<spectrogram.count {
             let currentFrame = spectrogram[i]
             let previousFrame = spectrogram[i-1]
-
+            
             var diff: [Float] = Array(repeating: 0.0, count: currentFrame.count)
             vDSP_vsub(previousFrame, 1, currentFrame, 1, &diff, 1, vDSP_Length(currentFrame.count))
-
+            
             // 하프 웨이브 정류 (양수 차이만 반영)
             let rectifiedDiff = diff.map { max(0, $0) }
             onsetStrengths.append(rectifiedDiff.reduce(0, +))
         }
         return onsetStrengths.reduce(0, +) / Float(onsetStrengths.count)
     }
-
+    
     // 2차원 배열의 표준편차 계산
     func calculateStd(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -453,19 +477,19 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         let variance = flatData.map { pow($0 - mean, 2) }.reduce(0, +) / Float(flatData.count)
         return sqrt(variance)
     }
-
+    
     // 2차원 배열의 최솟값 계산
     func calculateMin(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
         return flatData.min() ?? 0.0
     }
-
+    
     // 2차원 배열의 최댓값 계산
     func calculateMax(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
         return flatData.max() ?? 0.0
     }
-
+    
     // 2차원 배열의 중앙값 계산
     func calculateMedian(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -478,7 +502,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             return sortedData[mid]
         }
     }
-
+    
     // 2차원 배열의 분위수 계산 (25번째 또는 75번째 백분위수)
     func calculateQuantile(data: [[Float]], quantile: Float) -> Float {
         let flatData = data.flatMap { $0 }
@@ -487,7 +511,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         let index = Int(quantile * Float(sortedData.count - 1))
         return sortedData[index]
     }
-
+    
     // 2차원 배열의 첨도 계산
     func calculateSkewness(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -501,7 +525,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return sum / (Float(flatData.count) * pow(std, 3))
     }
-
+    
     // 2차원 배열의 왜도 계산
     func calculateKurtosis(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -515,7 +539,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return (sum / (Float(flatData.count) * pow(std, 4))) - 3
     }
-
+    
     // 2차원 배열의 에너지 계산
     func calculateEnergy(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -526,7 +550,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         vDSP_sve(squaredData, 1, &sumOfSquares, vDSP_Length(squaredData.count))
         return sumOfSquares
     }
-
+    
     // 2차원 배열의 RMS (제곱평균제곱근) 계산
     func calculateRMS(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -537,13 +561,13 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         vDSP_sve(squaredData, 1, &sumOfSquares, vDSP_Length(squaredData.count))
         return sqrt(sumOfSquares / Float(flatData.count))
     }
-
+    
     // 2차원 배열의 피크값 계산
     func calculatePeak(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
         return flatData.max() ?? 0.0
     }
-
+    
     // 2차원 배열의 크레스트 팩터 계산
     func calculateCrestFactor(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -553,32 +577,32 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         guard rms > 0 else { return 0.0 }
         return peak / rms
     }
-
+    
     // 2차원 배열의 스펙트럼 기울기 계산
     func calculateSpectralSlope(spectrogram: [[Float]], sampleRate: Float, n_fft: Int) -> Float {
         guard !spectrogram.isEmpty else { return 0.0 }
-
+        
         var slopes: [Float] = []
         let fftBins = n_fft / 2
         let frequencies = (0..<fftBins).map { Float($0) * sampleRate / Float(n_fft) }
-
+        
         for frame in spectrogram {
             guard frame.count > 1 else { continue }
             var sumX: Float = 0.0
             var sumY: Float = 0.0
             var sumXY: Float = 0.0
             var sumX2: Float = 0.0
-
+            
             for i in 0..<frame.count {
                 sumX += frequencies[i]
                 sumY += frame[i]
                 sumXY += frequencies[i] * frame[i]
                 sumX2 += frequencies[i] * frequencies[i]
             }
-
+            
             let numerator = Float(frame.count) * sumXY - sumX * sumY
             let denominator = Float(frame.count) * sumX2 - sumX * sumX
-
+            
             if denominator != 0 {
                 slopes.append(numerator / denominator)
             } else {
@@ -587,7 +611,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return slopes.reduce(0, +) / Float(slopes.count)
     }
-
+    
     // 2차원 배열의 조화평균 계산
     func calculateHarmonicMean(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
@@ -601,15 +625,15 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         guard sumReciprocals > 0 else { return 0.0 }
         return Float(flatData.count) / sumReciprocals
     }
-
+    
     // 2차원 배열의 엔트로피 계산
     func calculateEntropy(data: [[Float]]) -> Float {
         let flatData = data.flatMap { $0 }
         guard !flatData.isEmpty else { return 0.0 }
-
+        
         let totalSum = flatData.reduce(0, +)
         guard totalSum > 0 else { return 0.0 }
-
+        
         var entropy: Float = 0.0
         for x in flatData {
             if x > 0 {
@@ -619,7 +643,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return entropy
     }
-
+    
     // 멜 스펙트로그램을 로그 멜 스펙트로그램으로 변환
     func logMelSpectrogram(melSpec: [[Float]]) -> [[Float]] {
         return melSpec.map { frame in
@@ -628,12 +652,12 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             }
         }
     }
-
+    
     // 이산 코사인 변환 (DCT) 타입 II
     func dct(input: [Float], numCoefficients: Int) -> [Float] {
         let N = input.count
         var output = [Float](repeating: 0.0, count: numCoefficients)
-
+        
         for k in 0..<numCoefficients {
             var sum: Float = 0.0
             for n in 0..<N {
@@ -646,35 +670,35 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return output
     }
-
+    
     // 헤르츠(Hz)를 멜(Mel)로 변환
     func hzToMel(_ hz: Float) -> Float {
         return 2595 * log10(1 + hz / 700)
     }
-
+    
     // 멜(Mel)을 헤르츠(Hz)로 변환
     func melToHz(_ mel: Float) -> Float {
         return 700 * (pow(10, mel / 2595) - 1)
     }
-
+    
     // 멜 필터 뱅크 생성
     func melFilterBank(n_fft: Int, n_mels: Int, sampleRate: Float) -> [[Float]] {
         let maxHz = sampleRate / 2
         let minMel = hzToMel(0)
         let maxMel = hzToMel(maxHz)
-
+        
         let melPoints = (0..<n_mels + 2).map { melToHz(minMel + Float($0) * (maxMel - minMel) / Float(n_mels + 1)) }
-
+        
         let fftBins = n_fft / 2 + 1
         let binFrequencies = (0..<fftBins).map { Float($0) * sampleRate / Float(n_fft) }
-
+        
         var filterBank = [[Float]](repeating: [Float](repeating: 0.0, count: fftBins), count: n_mels)
-
+        
         for i in 0..<n_mels {
             let leftMel = melPoints[i]
             let centerMel = melPoints[i+1]
             let rightMel = melPoints[i+2]
-
+            
             for j in 0..<fftBins {
                 let freq = binFrequencies[j]
                 var weight: Float = 0.0
@@ -688,7 +712,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return filterBank
     }
-
+    
     // 멜 스펙트로그램 계산
     func melSpectrogram(spectrogram: [[Float]], melFilterBank: [[Float]]) -> [[Float]] {
         var melSpec: [[Float]] = []
@@ -703,22 +727,22 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         }
         return melSpec
     }
-
+    
     private func extractFeatures(samples: [Float], sampleRate: Float) -> [Float] {
         var features: [Float] = []
-
+        
         // 특징 추출을 위한 상수들
         let n_fft: Int = 2048
         let hop_length: Int = 512
         let n_mels: Int = 128
-
+        
         // 스펙트럼 특징을 위해 STFT를 한 번 계산
         let spectrogram = stft(samples: samples, n_fft: n_fft, hop_length: hop_length)
-
+        
         // 멜 필터 뱅크 및 멜 스펙트로그램 계산
         let melFB = melFilterBank(n_fft: n_fft, n_mels: n_mels, sampleRate: sampleRate)
         let melSpec = melSpectrogram(spectrogram: spectrogram, melFilterBank: melFB)
-
+        
         // --- 1. MFCC Features (13) ---
         let logMelSpec = logMelSpectrogram(melSpec: melSpec)
         var mfccs: [Float] = []
@@ -739,7 +763,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         } else {
             features.append(contentsOf: Array(repeating: 0.0, count: 13))
         }
-
+        
         // --- 2. Spectral Features (7) ---
         let spectralCentroids = calculateSpectralCentroid(spectrogram: spectrogram, sampleRate: sampleRate, n_fft: n_fft)
         features.append(spectralCentroids.reduce(0, +) / Float(spectralCentroids.count)) // spectral_centroid
@@ -755,28 +779,28 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         features.append(zeroCrossingRate) // zero_crossing_rate
         let rmsEnergy = calculateRMSEnergy(samples: samples)
         features.append(rmsEnergy) // rmse_energy
-
+        
         // --- 3. Energy Features (4) ---
         features.append(rmsEnergy) // rms_energy_mean
         let peakEnergy = samples.map { abs($0) }.max() ?? 0.0
         features.append(peakEnergy) // peak_energy
-
+        
         let energyEntropy = calculateEnergyEntropy(samples: samples, frameSize: n_fft, hopSize: hop_length)
         features.append(energyEntropy) // energy_entropy
-
+        
         let dynamicRange = calculateDynamicRange(peakEnergy: peakEnergy, rmsEnergy: rmsEnergy)
         features.append(dynamicRange) // dynamic_range
-
+        
         // --- 4. Rhythm Features (3) ---
         let onsetStrengthMean = calculateOnsetStrengthMean(spectrogram: spectrogram)
         features.append(contentsOf: Array(repeating: 0.0, count: 2)) // tempo, beat_strength (Placeholders)
         features.append(onsetStrengthMean) // onset_strength_mean
-
+        
         // --- 5. Watermelon Specific Features (8) ---
         // These are highly specialized and will require custom DSP.
         // Placeholder for now.
         features.append(contentsOf: Array(repeating: 0.0, count: 8)) // Placeholder
-
+        
         // --- 6. Mel-Spectrogram Statistical Features (16) ---
         // Calculate mean of Mel Spectrogram
         let melSpecMean = melSpec.flatMap { $0 }.reduce(0, +) / Float(melSpec.flatMap { $0 }.count)
@@ -811,10 +835,10 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         features.append(melSpecHarmonicMean) // mel_spec_harmonic_mean
         let melSpecEntropy = calculateEntropy(data: melSpec)
         features.append(melSpecEntropy) // mel_spec_entropy
-
+        
         // Total features: 13 + 7 + 4 + 3 + 8 + 16 = 51
         assert(features.count == 51, "Expected 51 features, got \(features.count)")
-
+        
         return features
     }
 }

@@ -1,8 +1,11 @@
 import SwiftUI
 import AVFoundation
+import UniformTypeIdentifiers
 
 struct ContentView: View {
     @StateObject private var audioFeatureExtractor = AudioFeatureExtractor()
+    @State private var isImporting: Bool = false
+    @State private var pickedFileURL: URL?
 
     let featureNames: [String] = [
         // MFCC Features (13)
@@ -69,6 +72,33 @@ struct ContentView: View {
                         .cornerRadius(10)
                 }
                 .padding()
+                
+                Button(action: {
+                    isImporting = true
+                }) {
+                    Text("오디오 파일 불러오기 및 분석")
+                        .font(.title2)
+                        .padding()
+                        .background(Color.green)
+                        .foregroundColor(.white)
+                        .cornerRadius(10)
+                }
+                .padding()
+                .fileImporter(isPresented: $isImporting, allowedContentTypes: [.audio], allowsMultipleSelection: false) { result in
+                    switch result {
+                    case .success(let urls):
+                        if let url = urls.first {
+                            if url.startAccessingSecurityScopedResource() {
+                                audioFeatureExtractor.analyzeExternalFile(url: url)
+                                url.stopAccessingSecurityScopedResource()
+                            } else {
+                                audioFeatureExtractor.errorMessage = "파일 접근 권한을 얻지 못했습니다."
+                            }
+                        }
+                    case .failure(let error):
+                        audioFeatureExtractor.errorMessage = "파일 선택 오류: \(error.localizedDescription)"
+                    }
+                }
 
                 if let errorMessage = audioFeatureExtractor.errorMessage {
                     Text("Error: \(errorMessage)")
@@ -109,7 +139,6 @@ struct ContentView: View {
         }
     }
 }
-
 
 #Preview {
     ContentView()
