@@ -740,8 +740,61 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         return melSpec
     }
     
+    // Fundamental frequency estimation (autocorrelation, naive)
+    func estimateFundamentalFrequency(samples: [Float], sampleRate: Float, minHz: Float = 50, maxHz: Float = 1000) -> Float {
+        guard samples.count > 1 else { return 0.0 }
+        let minLag = Int(sampleRate / maxHz)
+        let maxLag = Int(sampleRate / minHz)
+        var bestLag = minLag
+        var maxCorr: Float = 0.0
+        for lag in minLag...maxLag {
+            var sum: Float = 0.0
+            for i in 0..<(samples.count - lag) {
+                sum += samples[i] * samples[i + lag]
+            }
+            if sum > maxCorr {
+                maxCorr = sum
+                bestLag = lag
+            }
+        }
+        return bestLag > 0 ? sampleRate / Float(bestLag) : 0.0
+    }
+    
+    // Sub-band energy ratio calculator helper
+    func subbandEnergyRatio(samples: [Float], sampleRate: Float) -> Float {
+        let n_fft = 2048
+        var fftReal = [Float](samples.prefix(n_fft))
+        if fftReal.count < n_fft { fftReal += Array(repeating: 0, count: n_fft - fftReal.count) }
+        var imag = [Float](repeating: 0, count: n_fft)
+        var splitComplex = DSPSplitComplex(realp: &fftReal, imagp: &imag)
+        let log2n = vDSP_Length(log2(Float(n_fft)))
+        let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
+        fftReal.withUnsafeMutableBufferPointer { realPtr in
+            realPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n_fft/2) { complexPtr in
+                vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(n_fft/2))
+            }
+        }
+        vDSP_fft_zrip(fftSetup!, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
+        var mags = [Float](repeating: 0, count: n_fft/2)
+        vDSP_zvmags(&splitComplex, 1, &mags, 1, vDSP_Length(n_fft/2))
+        vDSP_destroy_fftsetup(fftSetup)
+        func bandEnergy(_ lowHz: Float, _ highHz: Float) -> Float {
+            let lowBin = Int(lowHz / sampleRate * Float(n_fft))
+            let highBin = Int(highHz / sampleRate * Float(n_fft))
+            guard lowBin < highBin && highBin < mags.count else { return 0 }
+            return mags[lowBin..<highBin].reduce(0, +)
+        }
+        let e1 = bandEnergy(250, 3000)
+        let e2 = bandEnergy(3000, 8000)
+        return e2 > 0 ? e1 / e2 : 0
+    }
+    
     private func extractFeatures(samples: [Float], sampleRate: Float) -> [Float] {
         var features: [Float] = []
+        
+        // Add fundamental frequency and sub-band ratio estimation early
+        let fundamental = estimateFundamentalFrequency(samples: samples, sampleRate: sampleRate)
+        let subband = subbandEnergyRatio(samples: samples, sampleRate: sampleRate)
         
         // 특징 추출을 위한 상수들
         let n_fft: Int = 2048
@@ -848,8 +901,12 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         let melSpecEntropy = calculateEntropy(data: melSpec)
         features.append(melSpecEntropy) // mel_spec_entropy
         
-        // Total features: 13 + 7 + 4 + 3 + 8 + 16 = 51
-        assert(features.count == 51, "Expected 51 features, got \(features.count)")
+        // --- 7. Added Features (2) ---
+        features.append(fundamental) // Fundamental Frequency
+        features.append(subband)     // Sub-band Energy Ratio
+        
+        // Total features: 13 + 7 + 4 + 3 + 8 + 16 + 2 = 53
+        assert(features.count == 53, "Expected 53 features, got \(features.count)")
         
         return features
     }

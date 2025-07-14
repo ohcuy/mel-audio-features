@@ -1,6 +1,15 @@
 import SwiftUI
 import AVFoundation
 
+let acousticFeatureIndices: [(name: String, idx: Int)] = [
+    ("기본 주파수 (Hz)", 0),
+    ("스펙트럼 중심 (Hz)", 13),
+    ("제로 크로싱 비율", 18),
+    ("RMS", 19),
+    ("멜스펙트로그램 엔트로피", 48),
+    ("서브밴드 에너지 비율", 49)
+]
+
 // 핵심 10가지 특징
 enum CoreFeature: String, CaseIterable {
     case fundamentalFrequency = "fundamental_frequency"
@@ -173,19 +182,18 @@ struct ArchiveView: View {
                         let rec1 = selectedRecords[0]
                         let rec2 = selectedRecords[1]
 
-                        ForEach(CoreFeature.allCases, id: \.rawValue) { feature in
-                            let idx = featureNames.index(for: feature)
+                        ForEach(acousticFeatureIndices, id: \.name) { feature in
                             HStack {
-                                Text("\(feature.rawValue)")
+                                Text(feature.name)
                                     .frame(width: 150, alignment: .leading)
                                     .font(.caption)
-                                if let i = idx, i < rec1.features.count, i < rec2.features.count {
-                                    Text(String(format: "%.4f", rec1.features[i]))
+                                if feature.idx < rec1.features.count && feature.idx < rec2.features.count {
+                                    Text(String(format: "%.4f", rec1.features[feature.idx]))
                                         .frame(width: 80, alignment: .trailing)
                                         .foregroundColor(.blue)
                                     Text("vs")
                                         .foregroundColor(.gray)
-                                    Text(String(format: "%.4f", rec2.features[i]))
+                                    Text(String(format: "%.4f", rec2.features[feature.idx]))
                                         .frame(width: 80, alignment: .trailing)
                                         .foregroundColor(.red)
                                 } else {
