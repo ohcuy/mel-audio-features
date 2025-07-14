@@ -97,6 +97,39 @@ struct ArchiveView: View {
         }
     }
     
+    // ripeness 판단용 헬퍼 함수 추가
+    private func judgeRipeness(featureValues1: [Float], featureValues2: [Float]) -> (ripeCount: Int, unripeCount: Int, isRipe: Bool, results: [Bool]) {
+        // Feature indices and direction: true = 값이 낮을수록 잘 익음, false = 높을수록 잘 익음
+        let criteria: [(idx: Int, lowIsRipe: Bool)] = [
+            (0, true),   // Fundamental Freq (낮음이 잘 익음)
+            (1, true),   // Spectral Centroid (낮음이 잘 익음)
+            (2, true),   // Zero Crossing Rate (낮음이 잘 익음)
+            (3, false),  // RMS (높음이 잘 익음)
+            (4, false),  // Entropy (높음이 잘 익음)
+            (5, false)   // Sub-band Energy Ratio (높음이 잘 익음)
+        ]
+        var ripe = 0, unripe = 0
+        var results: [Bool] = []
+        for c in criteria {
+            if c.idx < featureValues1.count, c.idx < featureValues2.count {
+                let v1 = featureValues1[c.idx], v2 = featureValues2[c.idx]
+                let ok: Bool
+                if c.lowIsRipe {
+                    // v1이 v2보다 낮으면 익음
+                    ok = v1 < v2
+                } else {
+                    // v1이 v2보다 높으면 익음
+                    ok = v1 > v2
+                }
+                if ok { ripe += 1 } else { unripe += 1 }
+                results.append(ok)
+            } else {
+                results.append(false)
+            }
+        }
+        return (ripe, unripe, ripe >= 4, results)
+    }
+    
     var body: some View {
         VStack {
             Text("녹음된 소리들")
@@ -181,8 +214,31 @@ struct ArchiveView: View {
                         Text("선택한 두 🍉 소리의 핵심 특징 비교").font(.headline).padding(.top)
                         let rec1 = selectedRecords[0]
                         let rec2 = selectedRecords[1]
-
-                        ForEach(acousticFeatureIndices, id: \.name) { feature in
+                        
+                        // 핵심 특징 값 배열 생성
+                        let features1 = acousticFeatureIndices.map { idxPair -> Float in
+                            if idxPair.idx < rec1.features.count {
+                                return rec1.features[idxPair.idx]
+                            }
+                            return 0
+                        }
+                        let features2 = acousticFeatureIndices.map { idxPair -> Float in
+                            if idxPair.idx < rec2.features.count {
+                                return rec2.features[idxPair.idx]
+                            }
+                            return 0
+                        }
+                        
+                        // ripeness 판단 호출
+                        let (ripeCount, unripeCount, isRipe, results) = judgeRipeness(featureValues1: features1, featureValues2: features2)
+                        
+                        Text("비교 결과: " + (isRipe ? "첫 번째 소리가 더 잘 익은 수박!" : "첫 번째 소리가 덜 익은 수박!"))
+                            .font(.title3)
+                            .foregroundColor(isRipe ? .green : .orange)
+                            .bold()
+                            .padding(.bottom, 6)
+                        
+                        ForEach(Array(acousticFeatureIndices.enumerated()), id: \.element.name) { i, feature in
                             HStack {
                                 Text(feature.name)
                                     .frame(width: 150, alignment: .leading)
@@ -190,12 +246,12 @@ struct ArchiveView: View {
                                 if feature.idx < rec1.features.count && feature.idx < rec2.features.count {
                                     Text(String(format: "%.4f", rec1.features[feature.idx]))
                                         .frame(width: 80, alignment: .trailing)
-                                        .foregroundColor(.blue)
+                                        .foregroundColor(results[i] ? .green : .orange)
                                     Text("vs")
                                         .foregroundColor(.gray)
                                     Text(String(format: "%.4f", rec2.features[feature.idx]))
                                         .frame(width: 80, alignment: .trailing)
-                                        .foregroundColor(.red)
+                                        .foregroundColor(results[i] ? .orange : .green)
                                 } else {
                                     Text("-").foregroundColor(.gray)
                                     Text("")
