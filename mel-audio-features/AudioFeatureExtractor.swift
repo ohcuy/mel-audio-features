@@ -18,6 +18,9 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
     private var audioPlayer: AVAudioPlayer?
     private var audioFileURL: URL?
     
+    private var recordingTimer: Timer?
+    private let maxRecordingDuration: TimeInterval = 3.0
+    
     @Published var isRecording = false
     @Published var extractedFeatures: [Float]? // 추출된 특징 벡터
     @Published var errorMessage: String?
@@ -70,6 +73,12 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             audioRecorder?.record()
             isRecording = true
             errorMessage = nil
+            
+            // Start auto-stop timer
+            recordingTimer?.invalidate()
+            recordingTimer = Timer.scheduledTimer(withTimeInterval: maxRecordingDuration, repeats: false) { [weak self] _ in
+                self?.stopRecording()
+            }
         } catch {
             errorMessage = "Could not start recording: \(error.localizedDescription)"
         }
@@ -77,6 +86,9 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
     
     // 녹음 종료 후 오디오 파일 처리
     func stopRecording() {
+        recordingTimer?.invalidate()
+        recordingTimer = nil
+        
         audioRecorder?.stop()
         isRecording = false
         if let url = audioFileURL {
