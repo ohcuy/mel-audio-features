@@ -1,6 +1,7 @@
 import SwiftUI
 import AVFoundation
 
+// 6가지 특징
 let acousticFeatureIndices: [(name: String, idx: Int)] = [
     ("기본 주파수 (Hz)", 0),
     ("스펙트럼 중심 (Hz)", 13),
@@ -229,8 +230,8 @@ struct ArchiveView: View {
                             return 0
                         }
                         
-                        // ripeness 판단 호출
-                        let (ripeCount, unripeCount, isRipe, results) = judgeRipeness(featureValues1: features1, featureValues2: features2)
+                        // 숙성도 판단
+                        let (_, _, isRipe, results) = judgeRipeness(featureValues1: features1, featureValues2: features2)
                         
                         Text("비교 결과: " + (isRipe ? "첫 번째 소리가 더 잘 익은 수박!" : "첫 번째 소리가 덜 익은 수박!"))
                             .font(.title3)

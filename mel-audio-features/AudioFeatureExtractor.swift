@@ -25,6 +25,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
     @Published var extractedFeatures: [Float]? // 추출된 특징 벡터
     @Published var errorMessage: String?
     @Published var archive: Archive = []
+    @Published var latestPrediction: PredictionResponse?
     
     private let archiveFileName = "audio_archive.json"
     
@@ -54,6 +55,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
     
     func analyzeExternalFile(url: URL) {
         processAudioFile(url: url)
+        self.sendAudioFileForPrediction(url: url)
     }
     
     func startRecording() {
@@ -137,7 +139,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             let originalFormat = originalAudioFile.processingFormat
             let targetFormat = AVAudioFormat(commonFormat: .pcmFormatFloat32, sampleRate: 22050, channels: 1, interleaved: false)!
 
-            let needsConversion = originalFormat.channelCount != 1 || originalFormat.commonFormat != .pcmFormatFloat32 || originalFormat.sampleRate != 22050
+            let needsConversion = originalFormat.channelCount != 1 || originalFormat.commonFormat != .pcmFormatFloat32 || originalFormat.sampleRate != 16000
             var audioFile: AVAudioFile = originalAudioFile
 
             if needsConversion {
@@ -188,11 +190,13 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             }
             let audioSamples = Array(UnsafeBufferPointer(start: floatChannelData[0], count: Int(frameCount)))
             let preprocessedSamples = preprocessAudio(samples: audioSamples, sampleRate: Float(format.sampleRate))
-            extractedFeatures = extractFeatures(samples: preprocessedSamples, sampleRate: 22050)
+            extractedFeatures = extractFeatures(samples: preprocessedSamples, sampleRate: 16000)
             if let features = self.extractedFeatures, !features.isEmpty {
-                let record = ArchiveRecord(id: UUID(), date: Date(), audioFileName: url.lastPathComponent, features: features)
+                let safeFeatures = features.map { $0.isFinite ? $0 : 0.0 }
+                let record = ArchiveRecord(id: UUID(), date: Date(), audioFileName: url.lastPathComponent, features: safeFeatures)
                 self.archive.append(record)
                 self.saveArchive()
+                self.sendAudioFileForPrediction(url: url)
             }
         } catch {
             errorMessage = "Error processing audio file: \(error.localizedDescription)"
@@ -327,26 +331,29 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
             
             var real = [Float](repeating: 0.0, count: n_fft / 2)
             var imag = [Float](repeating: 0.0, count: n_fft / 2)
-            var complex = DSPSplitComplex(realp: &real, imagp: &imag)
             
-            frame.withUnsafeMutableBufferPointer { (frameBuffer: inout UnsafeMutableBufferPointer<Float>) in
-                frameBuffer.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n_fft / 2) { (complexBuffer: UnsafeMutablePointer<DSPComplex>) in
-                    vDSP_ctoz(complexBuffer, 2, &complex, 1, vDSP_Length(n_fft / 2))
+            real.withUnsafeMutableBufferPointer { realPtr in
+                imag.withUnsafeMutableBufferPointer { imagPtr in
+                    var complex = DSPSplitComplex(realp: realPtr.baseAddress!, imagp: imagPtr.baseAddress!)
+                    frame.withUnsafeMutableBufferPointer { (frameBuffer: inout UnsafeMutableBufferPointer<Float>) in
+                        frameBuffer.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n_fft / 2) { (complexBuffer: UnsafeMutablePointer<DSPComplex>) in
+                            vDSP_ctoz(complexBuffer, 2, &complex, 1, vDSP_Length(n_fft / 2))
+                        }
+                    }
+
+                    vDSP_fft_zrip(fftSetup!, &complex, 1, log2n, FFTDirection(kFFTDirection_Forward))
+
+                    // 크기 계산
+                    var magnitudes = [Float](repeating: 0.0, count: n_fft / 2)
+                    vDSP_zvmags(&complex, 1, &magnitudes, 1, vDSP_Length(n_fft / 2))
+
+                    // 파워 스펙트럼으로 변환 (크기 제곱)
+                    var powerSpectrum = [Float](repeating: 0.0, count: n_fft / 2)
+                    vDSP_vsq(magnitudes, 1, &powerSpectrum, 1, vDSP_Length(n_fft / 2))
+
+                    spectrogram.append(powerSpectrum)
                 }
             }
-            
-            vDSP_fft_zrip(fftSetup!, &complex, 1, log2n, FFTDirection(kFFTDirection_Forward))
-            
-            // 크기 계산
-            var magnitudes = [Float](repeating: 0.0, count: n_fft / 2)
-            vDSP_zvmags(&complex, 1, &magnitudes, 1, vDSP_Length(n_fft / 2))
-            
-            // 파워 스펙트럼으로 변환 (크기 제곱)
-            var powerSpectrum = [Float](repeating: 0.0, count: n_fft / 2)
-            vDSP_vsq(magnitudes, 1, &powerSpectrum, 1, vDSP_Length(n_fft / 2))
-            
-            spectrogram.append(powerSpectrum)
-            
             vDSP_destroy_fftsetup(fftSetup)
         }
         return spectrogram
@@ -789,6 +796,256 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         return e2 > 0 ? e1 / e2 : 0
     }
     
+    // MARK: - New Helper Functions for Watermelon and Rhythm Features
+    
+    // 1. harmonic_ratio (ratio of harmonic energy to total energy)
+    private func calculateHarmonicRatio(samples: [Float], sampleRate: Float, fundamentalFreq: Float) -> Float {
+        guard fundamentalFreq > 0 else { return 0.0 }
+        let nHarmonics = 5
+        let bandwidthHz: Float = 50.0
+        let n_fft = 2048
+        
+        // FFT
+        var fftReal = [Float](samples.prefix(n_fft))
+        if fftReal.count < n_fft { fftReal += Array(repeating: 0, count: n_fft - fftReal.count) }
+        var imag = [Float](repeating: 0, count: n_fft)
+        var splitComplex = DSPSplitComplex(realp: &fftReal, imagp: &imag)
+        let log2n = vDSP_Length(log2(Float(n_fft)))
+        let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
+        fftReal.withUnsafeMutableBufferPointer { realPtr in
+            realPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n_fft/2) { complexPtr in
+                vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(n_fft/2))
+            }
+        }
+        vDSP_fft_zrip(fftSetup!, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
+        var mags = [Float](repeating: 0, count: n_fft/2)
+        vDSP_zvmags(&splitComplex, 1, &mags, 1, vDSP_Length(n_fft/2))
+        vDSP_destroy_fftsetup(fftSetup)
+        
+        let fftFreqResolution = sampleRate / Float(n_fft)
+        let totalEnergy = mags.reduce(0, +)
+        guard totalEnergy > 0 else { return 0.0 }
+        
+        var harmonicEnergy: Float = 0.0
+        for h in 1...nHarmonics {
+            let centerFreq = fundamentalFreq * Float(h)
+            let lowFreq = max(centerFreq - bandwidthHz/2, 0)
+            let highFreq = min(centerFreq + bandwidthHz/2, sampleRate/2)
+            let lowBin = Int(lowFreq / fftFreqResolution)
+            let highBin = Int(highFreq / fftFreqResolution)
+            if lowBin < highBin, highBin < mags.count {
+                harmonicEnergy += mags[lowBin..<highBin].reduce(0, +)
+            }
+        }
+        return harmonicEnergy / totalEnergy
+    }
+    
+    // 2. attack_time (time from start until signal reaches 90% of max amplitude)
+    private func calculateAttackTime(samples: [Float], sampleRate: Float) -> Float {
+        guard !samples.isEmpty else { return 0.0 }
+        let maxAmp = samples.map { abs($0) }.max() ?? 0
+        guard maxAmp > 0 else { return 0.0 }
+        let threshold = maxAmp * 0.9
+        for (index, sample) in samples.enumerated() {
+            if abs(sample) >= threshold {
+                return Float(index) / sampleRate
+            }
+        }
+        return 0.0
+    }
+    
+    // 3. decay_rate (rate of amplitude decrease after peak)
+    private func calculateDecayRate(samples: [Float], sampleRate: Float) -> Float {
+        guard samples.count > 1 else { return 0.0 }
+        let maxAmp = samples.map { abs($0) }.max() ?? 0
+        guard maxAmp > 0 else { return 0.0 }
+        let maxIndex = samples.firstIndex(where: { abs($0) == maxAmp }) ?? 0
+        let segment = samples.suffix(from: maxIndex)
+        if segment.count < 2 { return 0.0 }
+        
+        // Calculate linear decay rate (slope) in log amplitude
+        var times = [Float]()
+        var logAmps = [Float]()
+        for (i, s) in segment.enumerated() {
+            let amp = abs(s)
+            if amp > 0 {
+                times.append(Float(i) / sampleRate)
+                logAmps.append(log(amp))
+            }
+        }
+        guard times.count >= 2 else { return 0.0 }
+        
+        let n = Float(times.count)
+        let sumX = times.reduce(0, +)
+        let sumY = logAmps.reduce(0, +)
+        let sumXY = zip(times, logAmps).map(*).reduce(0, +)
+        let sumX2 = times.map { $0 * $0 }.reduce(0, +)
+        
+        let denominator = n * sumX2 - sumX * sumX
+        if denominator == 0 {
+            return 0.0
+        }
+        let slope = (n * sumXY - sumX * sumY) / denominator
+        return -slope // decay rate as positive value
+    }
+    
+    // 4. sustain_level (average amplitude after decay until end)
+    private func calculateSustainLevel(samples: [Float]) -> Float {
+        guard samples.count > 1 else { return 0.0 }
+        let maxAmp = samples.map { abs($0) }.max() ?? 0
+        guard maxAmp > 0 else { return 0.0 }
+        let maxIndex = samples.firstIndex(where: { abs($0) == maxAmp }) ?? 0
+        let sustainSegment = samples.suffix(from: maxIndex)
+        let sustainAmps = sustainSegment.map { abs($0) }
+        guard !sustainAmps.isEmpty else { return 0.0 }
+        let avgSustain = sustainAmps.reduce(0, +) / Float(sustainAmps.count)
+        return avgSustain
+    }
+    
+    // 5. brightness (ratio of high frequency energy to total energy)
+    private func calculateBrightness(samples: [Float], sampleRate: Float) -> Float {
+        let n_fft = 2048
+        var fftReal = [Float](samples.prefix(n_fft))
+        if fftReal.count < n_fft { fftReal += Array(repeating: 0, count: n_fft - fftReal.count) }
+        var imag = [Float](repeating: 0, count: n_fft)
+        var splitComplex = DSPSplitComplex(realp: &fftReal, imagp: &imag)
+        let log2n = vDSP_Length(log2(Float(n_fft)))
+        let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
+        fftReal.withUnsafeMutableBufferPointer { realPtr in
+            realPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n_fft/2) { complexPtr in
+                vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(n_fft/2))
+            }
+        }
+        vDSP_fft_zrip(fftSetup!, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
+        var mags = [Float](repeating: 0, count: n_fft/2)
+        vDSP_zvmags(&splitComplex, 1, &mags, 1, vDSP_Length(n_fft/2))
+        vDSP_destroy_fftsetup(fftSetup)
+        
+        let freqResolution = sampleRate / Float(n_fft)
+        let cutoffBin = Int(3000 / freqResolution) // cutoff at 3kHz
+        let lowEnergy = mags.prefix(cutoffBin).reduce(0, +)
+        let highEnergy = mags.suffix(from: cutoffBin).reduce(0, +)
+        let totalEnergy = lowEnergy + highEnergy
+        guard totalEnergy > 0 else { return 0.0 }
+        return highEnergy / totalEnergy
+    }
+    
+    // 6. roughness (measure of rapid amplitude fluctuations)
+    private func calculateRoughness(samples: [Float], sampleRate: Float) -> Float {
+        guard samples.count > 1 else { return 0.0 }
+        let lhs = Array(samples.dropFirst())
+        let rhs = Array(samples.dropLast())
+        var diff = [Float](repeating: 0.0, count: samples.count - 1)
+        lhs.withUnsafeBufferPointer { lhsPtr in
+            rhs.withUnsafeBufferPointer { rhsPtr in
+                vDSP_vsub(lhsPtr.baseAddress!, 1, rhsPtr.baseAddress!, 1, &diff, 1, vDSP_Length(diff.count))
+            }
+        }
+        let absDiff = diff.map { abs($0) }
+        let roughness = absDiff.reduce(0, +) / Float(absDiff.count)
+        return roughness
+    }
+    
+    // 7. inharmonicity (degree deviation from perfect harmonic partials)
+    private func calculateInharmonicity(samples: [Float], sampleRate: Float, fundamentalFreq: Float) -> Float {
+        guard fundamentalFreq > 0 else { return 0.0 }
+        let nHarmonics = 5
+        let n_fft = 2048
+        
+        // FFT
+        var fftReal = [Float](samples.prefix(n_fft))
+        if fftReal.count < n_fft { fftReal += Array(repeating: 0, count: n_fft - fftReal.count) }
+        var imag = [Float](repeating: 0, count: n_fft)
+        var splitComplex = DSPSplitComplex(realp: &fftReal, imagp: &imag)
+        let log2n = vDSP_Length(log2(Float(n_fft)))
+        let fftSetup = vDSP_create_fftsetup(log2n, FFTRadix(kFFTRadix2))
+        fftReal.withUnsafeMutableBufferPointer { realPtr in
+            realPtr.baseAddress!.withMemoryRebound(to: DSPComplex.self, capacity: n_fft/2) { complexPtr in
+                vDSP_ctoz(complexPtr, 2, &splitComplex, 1, vDSP_Length(n_fft/2))
+            }
+        }
+        vDSP_fft_zrip(fftSetup!, &splitComplex, 1, log2n, FFTDirection(FFT_FORWARD))
+        var mags = [Float](repeating: 0, count: n_fft/2)
+        vDSP_zvmags(&splitComplex, 1, &mags, 1, vDSP_Length(n_fft/2))
+        vDSP_destroy_fftsetup(fftSetup)
+        
+        let freqResolution = sampleRate / Float(n_fft)
+        var inharmonicities: [Float] = []
+        
+        for h in 1...nHarmonics {
+            let expectedFreq = fundamentalFreq * Float(h)
+            let expectedBin = Int(expectedFreq / freqResolution)
+            if expectedBin < 1 || expectedBin >= mags.count - 1 {
+                continue
+            }
+            // Find peak magnitude in a small neighborhood around expected bin
+            let neighborhood = mags[max(0, expectedBin-1)...min(mags.count-1, expectedBin+1)]
+            let peakMag = neighborhood.max() ?? 0.0
+            // Actual frequency bin of peak
+            let peakIndex = neighborhood.firstIndex(of: peakMag) ?? expectedBin
+            let actualFreq = Float(peakIndex) * freqResolution
+            
+            let deviation = abs(actualFreq - expectedFreq) / expectedFreq
+            inharmonicities.append(deviation)
+        }
+        if inharmonicities.isEmpty { return 0.0 }
+        return inharmonicities.reduce(0, +) / Float(inharmonicities.count)
+    }
+    
+    // 8. tempo (estimate tempo in bpm using simple autocorrelation on onset envelope)
+    private func calculateTempo(spectrogram: [[Float]], sampleRate: Float, hopLength: Int) -> Float {
+        guard spectrogram.count > 1 else { return 0.0 }
+        var onsetEnvelope = [Float](repeating: 0.0, count: spectrogram.count)
+        for i in 0..<spectrogram.count {
+            onsetEnvelope[i] = spectrogram[i].reduce(0, +)
+        }
+        
+        // Autocorrelation of onset envelope
+        let maxLag = min(200, onsetEnvelope.count - 1)
+        var autocorr = [Float](repeating: 0.0, count: maxLag)
+        for lag in 1..<maxLag {
+            var sum: Float = 0.0
+            for i in 0..<(onsetEnvelope.count - lag) {
+                sum += onsetEnvelope[i] * onsetEnvelope[i + lag]
+            }
+            autocorr[lag] = sum
+        }
+        let maxCorr = autocorr.max() ?? 0.0
+        guard maxCorr > 0 else { return 0.0 }
+        
+        guard let bestLag = autocorr.firstIndex(of: maxCorr) else { return 0.0 }
+        // Convert lag to bpm: lag frames * hopLength samples / sampleRate seconds per beat
+        let secondsPerBeat = Float(bestLag * hopLength) / sampleRate
+        guard secondsPerBeat > 0 else { return 0.0 }
+        let bpm = 60.0 / secondsPerBeat
+        return bpm
+    }
+    
+    // 9. beat_strength (max autocorrelation value normalized)
+    private func calculateBeatStrength(spectrogram: [[Float]]) -> Float {
+        guard spectrogram.count > 1 else { return 0.0 }
+        var onsetEnvelope = [Float](repeating: 0.0, count: spectrogram.count)
+        for i in 0..<spectrogram.count {
+            onsetEnvelope[i] = spectrogram[i].reduce(0, +)
+        }
+        let maxLag = min(200, onsetEnvelope.count - 1)
+        var autocorr = [Float](repeating: 0.0, count: maxLag)
+        for lag in 1..<maxLag {
+            var sum: Float = 0.0
+            for i in 0..<(onsetEnvelope.count - lag) {
+                sum += onsetEnvelope[i] * onsetEnvelope[i + lag]
+            }
+            autocorr[lag] = sum
+        }
+        guard let maxCorr = autocorr.max(), maxCorr > 0 else { return 0.0 }
+        let energy = onsetEnvelope.reduce(0, { $0 + $1 * $1 })
+        guard energy > 0 else { return 0.0 }
+        let normalized = maxCorr / energy
+        return normalized
+    }
+    
+    // MARK: - Feature Extraction
+    
     private func extractFeatures(samples: [Float], sampleRate: Float) -> [Float] {
         var features: [Float] = []
         
@@ -823,7 +1080,7 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
                 for j in 0..<logMelSpec.count {
                     sum += mfccs[j * 13 + i]
                 }
-                features.append(sum / frameCount)
+                features.append(sum / frameCount) // MFCC coefficient mean
             }
         } else {
             features.append(contentsOf: Array(repeating: 0.0, count: 13))
@@ -857,14 +1114,30 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         features.append(dynamicRange) // dynamic_range
         
         // --- 4. Rhythm Features (3) ---
+        let tempo = calculateTempo(spectrogram: spectrogram, sampleRate: sampleRate, hopLength: hop_length)
+        let beatStrength = calculateBeatStrength(spectrogram: spectrogram)
         let onsetStrengthMean = calculateOnsetStrengthMean(spectrogram: spectrogram)
-        features.append(contentsOf: Array(repeating: 0.0, count: 2)) // tempo, beat_strength (Placeholders)
+        features.append(tempo) // tempo
+        features.append(beatStrength) // beat_strength
         features.append(onsetStrengthMean) // onset_strength_mean
         
         // --- 5. Watermelon Specific Features (8) ---
-        // These are highly specialized and will require custom DSP.
-        // Placeholder for now.
-        features.append(contentsOf: Array(repeating: 0.0, count: 8)) // Placeholder
+        let harmonicRatio = calculateHarmonicRatio(samples: samples, sampleRate: sampleRate, fundamentalFreq: fundamental)
+        let attackTime = calculateAttackTime(samples: samples, sampleRate: sampleRate)
+        let decayRate = calculateDecayRate(samples: samples, sampleRate: sampleRate)
+        let sustainLevel = calculateSustainLevel(samples: samples)
+        let brightness = calculateBrightness(samples: samples, sampleRate: sampleRate)
+        let roughness = calculateRoughness(samples: samples, sampleRate: sampleRate)
+        let inharmonicity = calculateInharmonicity(samples: samples, sampleRate: sampleRate, fundamentalFreq: fundamental)
+        
+        features.append(harmonicRatio) // harmonic_ratio
+        features.append(attackTime) // attack_time
+        features.append(decayRate) // decay_rate
+        features.append(sustainLevel) // sustain_level
+        features.append(brightness) // brightness
+        features.append(roughness) // roughness
+        features.append(inharmonicity) // inharmonicity
+        features.append(0.0) // Placeholder for fundamental_freq as it's already appended below (to keep 8 features)
         
         // --- 6. Mel-Spectrogram Statistical Features (16) ---
         // Calculate mean of Mel Spectrogram
@@ -910,4 +1183,18 @@ class AudioFeatureExtractor: NSObject, ObservableObject, AVAudioRecorderDelegate
         
         return features
     }
+    
+    private func sendAudioFileForPrediction(url: URL) {
+        WatermelonAPIService.shared.predictWatermelon(audioFileURL: url) { [weak self] result in
+            DispatchQueue.main.async {
+                switch result {
+                case .success(let response):
+                    self?.latestPrediction = response
+                case .failure(let error):
+                    self?.errorMessage = error.localizedDescription
+                }
+            }
+        }
+    }
 }
+
